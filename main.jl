@@ -39,13 +39,13 @@ sampleX1(n_samples) = SwitchingState(ContinuousState(T.(rand(X1_continuous_distr
 
 n_samples = 400 # Who knows what will be computationally tractable? 
 
-P = SwitchingProcess(BrownianMotion(0.0f0, 1.0f0), UniformDiscrete(1.0f0))
+P = SwitchingProcess(BrownianMotion(0.15f0), UniformDiscrete(0.5f0))
 
 # Optimiser 
 eta = 1e-3
 opt_state = Flux.setup(AdamW(eta = eta), model)
 
-iters = 1000
+iters = 4000
 for i in 1:iters
     # Sample a batch of data
     X0 = sampleX0(n_samples)
@@ -71,4 +71,10 @@ end
 n_inference_samples = 20000
 X0 = ContinuousState(T.(rand(X0_continuous_distribution, 1, n_inference_samples)))
 samples = gen(BrownianMotion(0.0f0, 1.0f0), X0, model, 0f0:0.005f0:1f0)
-histogram(samples.state[:,])
+vals = vec(samples.state)
+xs = range(minimum(vals) - 1, maximum(vals) + 1, length=400)
+histogram(vals; normalize=:pdf, label = "Samples", alpha = 0.35)
+plot!(xs, pdf.(X1_continuous_distribution, xs); lw = 2, label = "Mixture pdf")
+xlabel!("x")
+ylabel!("density")
+title!("Empirical vs theoretical mixture density at t=1")
