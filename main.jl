@@ -45,7 +45,7 @@ P = SwitchingProcess(BrownianMotion(0.15f0), UniformDiscrete(0.5f0))
 eta = 1e-3
 opt_state = Flux.setup(AdamW(eta = eta), model)
 
-iters = 4000
+iters = 1000
 for i in 1:iters
     # Sample a batch of data
     X0 = sampleX0(n_samples)
@@ -59,8 +59,8 @@ for i in 1:iters
         x1 = tensor(X1.continuous_state)
         # +1 if latent==1 (bridge to X1), -1 otherwise (bridge to -X1)
         sgn = ifelse.(Xt.discrete_state.state .== 1, one(eltype(x1)), -one(eltype(x1)))
-        target = expand(x1, ndims(ŷ)) .* expand(sgn, ndims(ŷ))
-        mean((ŷ .- target) .^ 2)
+        X1_signed = ContinuousState(expand(x1, ndims(ŷ)) .* expand(sgn, ndims(ŷ)))
+        floss(P.continuous_process, ŷ, X1_signed, scalefloss(P.continuous_process, t))
     end
     Flux.update!(opt_state, model, ∇model)
     if i % 100 == 0
@@ -70,11 +70,45 @@ end
 
 n_inference_samples = 20000
 X0 = ContinuousState(T.(rand(X0_continuous_distribution, 1, n_inference_samples)))
-samples = gen(BrownianMotion(0.0f0, 1.0f0), X0, model, 0f0:0.005f0:1f0)
+
+paths = Tracker()
+
+
+samples = gen(BrownianMotion(0.0f0, 1.0f0), X0, model, 0f0:0.005f0:1f0, tracker = paths)
+tvec = stack_tracker(paths, :t)
+xttraj = stack_tracker(paths, :xt)
+
+# Trajectories from t ∈ [0,1] and a right-anchored histogram at t=1
 vals = vec(samples.state)
-xs = range(minimum(vals) - 1, maximum(vals) + 1, length=400)
-histogram(vals; normalize=:pdf, label = "Samples", alpha = 0.35)
-plot!(xs, pdf.(X1_continuous_distribution, xs); lw = 2, label = "Mixture pdf")
-xlabel!("x")
-ylabel!("density")
-title!("Empirical vs theoretical mixture density at t=1")
+pl = plot(; legend = :topright)
+for i in 1:10:n_inference_samples
+    plot!(tvec, xttraj[1,i,:], color = "red", label = i==1 ? "Trajectory" : :none, alpha = 0.05)
+end
+
+# Build a simple pdf-normalized histogram without extra deps
+nbins = 40
+vmin = minimum(vals)
+vmax = maximum(vals)
+edges = collect(range(vmin, vmax; length = nbins + 1))
+binwidth = edges[2] - edges[1]
+densities = zeros(Float64, nbins)
+for i in 1:nbins
+    lo = edges[i]
+    hi = edges[i+1]
+    densities[i] = count(x -> (x >= lo) && (x < hi), vals)
+end
+densities ./= (length(vals) * binwidth)  # normalize to pdf
+
+# Draw the histogram as horizontal bars anchored at t = 1
+α = 0.2
+for i in 1:nbins
+    xcoords = [1, 1 + α * densities[i], 1 + α * densities[i], 1]
+    ycoords = [edges[i], edges[i], edges[i+1], edges[i+1]]
+    plot!(xcoords, ycoords; seriestype = :shape, c = :gray, a = 0.35, lc = :gray, label = i == 1 ? "t=1 hist" : :none)
+end
+
+xlabel!("t")
+ylabel!("x")
+xlims!(0, 1 + α * (isempty(densities) ? 0 : maximum(densities)) * 1.2)
+title!("Marginal trjaectories")
+display(pl)
