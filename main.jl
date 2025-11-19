@@ -32,7 +32,7 @@ model = FModel(embeddim = 128, layers = 3, spacedim = 1)
 
 T = Float32
 X0_continuous_distribution = Normal(0,1)
-X1_continuous_distribution = MixtureModel([Normal(0,1), Normal(1,0.1), Normal(-2,0.5)], [0.8,0.1,0.1])
+X1_continuous_distribution = MixtureModel([Normal(1,1), Normal(0,0.5), Normal(5,0.1)], [0.2,0.7,0.1])
 
 sampleX0(n_samples) = SwitchingState(ContinuousState(T.(rand(X0_continuous_distribution, 1, n_samples))), DiscreteState(2, rand(1:2, 1, n_samples))) # In the beginning, we randomly either bridge to the endpoint (1) or to its negation (2)
 sampleX1(n_samples) = SwitchingState(ContinuousState(T.(rand(X1_continuous_distribution, 1, n_samples))), DiscreteState(2, ones(Int, 1, n_samples))) # Always end bridging towards the endpoint (1)
@@ -45,7 +45,7 @@ P = SwitchingProcess(BrownianMotion(0.0f0, 1.0f0), UniformDiscrete(1.0f0))
 eta = 1e-3
 opt_state = Flux.setup(AdamW(eta = eta), model)
 
-iters = 4000
+iters = 1000
 for i in 1:iters
     # Sample a batch of data
     X0 = sampleX0(n_samples)
@@ -67,3 +67,8 @@ for i in 1:iters
         @info "iter=$i loss=$(l)"
     end
 end
+
+n_inference_samples = 20000
+X0 = ContinuousState(T.(rand(X0_continuous_distribution, 1, n_inference_samples)))
+samples = gen(BrownianMotion(0.0f0, 1.0f0), X0, model, 0f0:0.005f0:1f0)
+histogram(samples.state[:,])
