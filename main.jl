@@ -39,7 +39,7 @@ sampleX1(n_samples) = SwitchingState(ContinuousState(T.(rand(X1_continuous_distr
 
 n_samples = 400 # Who knows what will be computationally tractable? 
 
-P = SwitchingProcess(BrownianMotion(0.15f0), UniformDiscrete(0.5f0))
+P = SwitchingProcess(BrownianMotion(1f0), UniformDiscrete(0.25f0))
 
 # Optimiser 
 eta = 1e-3
@@ -68,7 +68,7 @@ for i in 1:iters
     end
 end
 
-n_inference_samples = 20000
+n_inference_samples = 2000
 X0 = ContinuousState(T.(rand(X0_continuous_distribution, 1, n_inference_samples)))
 
 paths = Tracker()
@@ -80,9 +80,9 @@ xttraj = stack_tracker(paths, :xt)
 
 # Trajectories from t ∈ [0,1] and a right-anchored histogram at t=1
 vals = vec(samples.state)
-pl = plot(; legend = :topright)
+pl = plot(; legend = :none, size = (900, 600))
 for i in 1:10:n_inference_samples
-    plot!(tvec, xttraj[1,i,:], color = "red", label = i==1 ? "Trajectory" : :none, alpha = 0.05)
+    plot!(tvec, xttraj[1,i,:], color = "red", label = :none, alpha = 0.2)
 end
 
 # Build a simple pdf-normalized histogram without extra deps
@@ -104,11 +104,73 @@ densities ./= (length(vals) * binwidth)  # normalize to pdf
 for i in 1:nbins
     xcoords = [1, 1 + α * densities[i], 1 + α * densities[i], 1]
     ycoords = [edges[i], edges[i], edges[i+1], edges[i+1]]
-    plot!(xcoords, ycoords; seriestype = :shape, c = :gray, a = 0.35, lc = :gray, label = i == 1 ? "t=1 hist" : :none)
+    plot!(xcoords, ycoords; seriestype = :shape, c = :gray, a = 0.35, lc = :gray, label = :none)
 end
 
 xlabel!("t")
 ylabel!("x")
 xlims!(0, 1 + α * (isempty(densities) ? 0 : maximum(densities)) * 1.2)
-title!("Marginal trjaectories")
+title!("Marginal trajectories")
 display(pl)
+
+# ------------------------------------------------------------
+# Conditional trajectories (SwitchingProcess endpoint-conditioned)
+# ------------------------------------------------------------
+
+# Generate X0, X1 for conditional sampling
+X0_sw = sampleX0(n_inference_samples)
+X1_sw = sampleX1(n_inference_samples)
+
+# Compute endpoint-conditioned final samples for histogram
+cond_samples = endpoint_conditioned_sample(X1_sw, X0_sw, P, T(1))
+
+# Plot trajectories for a subset with per-sample trackers
+pl_cond = plot(; legend = :none, size = (900, 600))
+for i in 1:10:n_inference_samples
+    cpaths = Tracker()
+    # Slice out single-sample SwitchingStates (views to avoid copies)
+    X0_i = SwitchingState(
+        ContinuousState(view(X0_sw.continuous_state.state, 1:1, i:i)),
+        DiscreteState(X0_sw.discrete_state.K, view(X0_sw.discrete_state.state, 1:1, i:i)),
+    )
+    X1_i = SwitchingState(
+        ContinuousState(view(X1_sw.continuous_state.state, 1:1, i:i)),
+        DiscreteState(X1_sw.discrete_state.K, view(X1_sw.discrete_state.state, 1:1, i:i)),
+    )
+    _ = endpoint_conditioned_sample(X1_i, X0_i, P, T(1); tracker = cpaths)
+    tvec_c = cpaths.t
+    xttraj_c = stack_tracker(cpaths, :xt; tuple_index = 1) # continuous component
+    plot!(tvec_c, vec(xttraj_c[1,1,:]); color = "red", label = :none, alpha = 0.2)
+end
+
+# Build a right-anchored histogram at t=1 for conditional samples
+vals_c = vec(cond_samples.continuous_state.state)
+nbins_c = 40
+vmin_c = minimum(vals_c)
+vmax_c = maximum(vals_c)
+edges_c = collect(range(vmin_c, vmax_c; length = nbins_c + 1))
+binwidth_c = edges_c[2] - edges_c[1]
+densities_c = zeros(Float64, nbins_c)
+for i in 1:nbins_c
+    lo = edges_c[i]
+    hi = edges_c[i+1]
+    densities_c[i] = count(x -> (x >= lo) && (x < hi), vals_c)
+end
+densities_c ./= (length(vals_c) * binwidth_c)  # normalize to pdf
+
+αc = 0.2
+for i in 1:nbins_c
+    xcoords = [1, 1 + αc * densities_c[i], 1 + αc * densities_c[i], 1]
+    ycoords = [edges_c[i], edges_c[i], edges_c[i+1], edges_c[i+1]]
+    plot!(pl_cond, xcoords, ycoords; seriestype = :shape, c = :gray, a = 0.35, lc = :gray, label = :none)
+end
+
+xlabel!(pl_cond, "t")
+ylabel!(pl_cond, "x")
+xlims!(pl_cond, 0, 1 + αc * (isempty(densities_c) ? 0 : maximum(densities_c)) * 1.2)
+title!(pl_cond, "Conditional trajectories")
+display(pl_cond)
+
+# Combine both figures and save to a single PDF
+pl_both = plot(pl, pl_cond; layout = (2,1), size = (900, 1400))
+savefig(pl_both, "trajectories_comparison.pdf")
