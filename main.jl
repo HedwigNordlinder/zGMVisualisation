@@ -2,6 +2,7 @@ using Pkg
 Pkg.activate("/Users/hedwignordlinder/Documents/Code/Julia/Karolinska/zGMVisualisation/")
 using Revise
 using ForwardBackward, Flowfusion, Flux, RandomFeatureMaps, Optimisers, Plots, Distributions
+include("sexyanimation.jl")
 
 struct FModel{A}
     layers::A
@@ -28,18 +29,18 @@ function (f::FModel)(t, Xt)
     tXt .+ l.decode(x) .* (1.05f0 .- expand(t, ndims(tXt))) 
 end
 
-model = FModel(embeddim = 128, layers = 3, spacedim = 1)
+model = FModel(embeddim = 256, layers = 4, spacedim = 1)
 
 T = Float32
 X0_continuous_distribution = Normal(0,1)
-X1_continuous_distribution = MixtureModel([Normal(1,1), Normal(0,0.5), Normal(5,0.1)], [0.2,0.7,0.1])
+X1_continuous_distribution = MixtureModel([Normal(1,1), Normal(5,0.5)], [0.5,0.5])
 
 sampleX0(n_samples) = SwitchingState(ContinuousState(T.(rand(X0_continuous_distribution, 1, n_samples))), DiscreteState(2, rand(1:2, 1, n_samples))) # In the beginning, we randomly either bridge to the endpoint (1) or to its negation (2)
 sampleX1(n_samples) = SwitchingState(ContinuousState(T.(rand(X1_continuous_distribution, 1, n_samples))), DiscreteState(2, ones(Int, 1, n_samples))) # Always end bridging towards the endpoint (1)
 
 n_samples = 400 # Who knows what will be computationally tractable? 
 
-P = SwitchingProcess(BrownianMotion(1f0), UniformDiscrete(0.25f0))
+P = SwitchingProcess(Deterministic(), UniformDiscrete(0.5f0))
 
 # Optimiser 
 eta = 1e-3
@@ -74,7 +75,7 @@ X0 = ContinuousState(T.(rand(X0_continuous_distribution, 1, n_inference_samples)
 paths = Tracker()
 
 
-samples = gen(BrownianMotion(0.0f0, 1.0f0), X0, model, 0f0:0.005f0:1f0, tracker = paths)
+samples = gen(Deterministic(), X0, model, 0f0:0.005f0:1f0, tracker = paths)
 tvec = stack_tracker(paths, :t)
 xttraj = stack_tracker(paths, :xt)
 
@@ -112,6 +113,19 @@ ylabel!("x")
 xlims!(0, 1 + α * (isempty(densities) ? 0 : maximum(densities)) * 1.2)
 title!("Marginal trajectories")
 display(pl)
+
+# Save marginal multi-dot animation (~100 samples) with visible paths and smooth slow-down
+_ = animate_tracker_multi(
+    paths;
+    sample_indices=1:100,
+    outpath="marginal_animation.gif",
+    fps=45,
+    speed=0.6,
+    show_paths=true,
+    linecolor=:red,
+    linealpha=0.5,
+    path_sample_stride=1,
+)
 
 # ------------------------------------------------------------
 # Conditional trajectories (SwitchingProcess endpoint-conditioned)
@@ -170,6 +184,20 @@ ylabel!(pl_cond, "x")
 xlims!(pl_cond, 0, 1 + αc * (isempty(densities_c) ? 0 : maximum(densities_c)) * 1.2)
 title!(pl_cond, "Conditional trajectories")
 display(pl_cond)
+
+# Save conditional multi-dot animation (~100 samples) with visible paths and smooth slow-down
+_ = animate_conditional_multi(
+    X0_sw, X1_sw, P;
+    sample_indices=1:100,
+    δt=0.01,
+    outpath="conditional_animation.gif",
+    fps=45,
+    speed=0.6,
+    show_paths=true,
+    linecolor=:red,
+    linealpha=0.5,
+    path_sample_stride=1,
+)
 
 # Combine both figures and save to a single PDF
 pl_both = plot(pl, pl_cond; layout = (2,1), size = (900, 1400))
