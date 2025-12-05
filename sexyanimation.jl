@@ -226,6 +226,7 @@ function animate_conditional_multi(X0_sw, X1_sw, P;
     # Build per-sample trackers and gather into arrays
     tvec_ref = nothing
     Y = nothing
+    D = nothing  # Discrete states
     y_final = Float64[]
     for (k, i) in enumerate(inds)
         cpaths = Tracker()
@@ -241,14 +242,18 @@ function animate_conditional_multi(X0_sw, X1_sw, P;
         _ = ForwardBackward.endpoint_conditioned_sample(X1_i, X0_i, P, eltype(X0_sw.continuous_state.state)(1); δt = δt, tracker = cpaths)
         tvec_i = stack_tracker(cpaths, :t)
         xttraj_i = stack_tracker(cpaths, :xt; tuple_index = 1) # continuous component
+        discrete_traj_i = stack_tracker(cpaths, :xt; tuple_index = 2) # discrete component
         y_i = vec(xttraj_i[1, 1, :])
+        d_i = vec(discrete_traj_i[1, 1, :])
         if tvec_ref === nothing
             tvec_ref = tvec_i
             Y = Array{Float64}(undef, length(inds), length(tvec_ref))
+            D = Array{Int}(undef, length(inds), length(tvec_ref))
         else
             @assert length(tvec_i) == length(tvec_ref) "All conditional trajectories must share the same time grid."
         end
         Y[k, :] = y_i
+        D[k, :] = d_i
         push!(y_final, y_i[end])
     end
     @assert tvec_ref !== nothing
@@ -288,16 +293,25 @@ function animate_conditional_multi(X0_sw, X1_sw, P;
             ycoords = [edges[i], edges[i], edges[i+1], edges[i+1]]
             plot!(plt, xcoords, ycoords; seriestype = :shape, c = :gray, a = 0.35, lc = :gray, label = :none)
         end
-        # Underlying paths (optional)
+        # Underlying paths (optional), colored by discrete state
         if show_paths
             for k in 1:path_sample_stride:size(Y, 1)
-                plot!(plt, tvec_ref, Y[k, :]; color = linecolor, alpha = linealpha, label = :none)
+                # Plot segments colored by destination
+                # discrete state 1 = bridging to x1 (blue), discrete state 2 = bridging to -x1 (red)
+                for j in 1:(length(tvec_ref)-1)
+                    seg_color = D[k, j] == 1 ? :blue : :red
+                    plot!(plt, tvec_ref[j:j+1], Y[k, j:j+1]; 
+                          color = seg_color, alpha = linealpha, label = :none)
+                end
             end
         end
-        # Moving dots
+        # Moving dots, colored by current discrete state
         yj = (1 - w) .* Y[:, j0] .+ w .* Y[:, j1]
         xcoords = fill(tj, size(Y, 1))
-        scatter!(plt, xcoords, yj; color = markercolor, markersize = markersize, label = :none)
+        # Color dots by discrete state: 1 -> blue, 2 -> red
+        dj = D[:, j0]  # Use discrete state at current time point
+        colors = [d == 1 ? :blue : :red for d in dj]
+        scatter!(plt, xcoords, yj; color = colors, markersize = markersize, label = :none)
         xlabel!(plt, "t")
         ylabel!(plt, "x")
         xlims!(plt, 0, x_right)
