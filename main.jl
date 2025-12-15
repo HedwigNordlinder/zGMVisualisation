@@ -65,7 +65,7 @@ n_samples = 400 # Who knows what will be computationally tractable?
 # Rate function for bridging
 # Returns (rate_to_x1, rate_to_neg_x1) - the rates for bridging to each endpoint
 # Base rate μ = 0.5, higher when continuous state is above 0
-μ = 0.5f0
+μ = 10f0
 
 # Rate function takes (t, state) and returns (rate_to_x1, rate_to_neg_x1)
 function rate_func(t, state::ForwardBackward.SwitchingState)
