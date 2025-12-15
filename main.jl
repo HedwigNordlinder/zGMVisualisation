@@ -13,8 +13,26 @@ struct FModel{A}
 end
 Flux.@layer FModel
 function FModel(; embeddim = 128, spacedim = 2, layers = 3)
-    embed_time = Chain(RandomFourierFeatures(1 => 4*embeddim, 1f0), Dense(4*embeddim => embeddim, swish))
-    embed_state = Chain(RandomFourierFeatures(1 => 4*embeddim, 1f0), Dense(4*embeddim => embeddim, swish))
+    # Split the embedding dimension in half for two scales
+    half_dim = embeddim ÷ 2
+    
+    # Scale 1: Low frequency (Global structure)
+    rff_low = RandomFourierFeatures(1 => 2*half_dim, 1f0)
+    
+    # Scale 2: High frequency (Sharp transitions)
+    rff_high = RandomFourierFeatures(1 => 2*half_dim, 5f0)
+    
+    # Combined embedding: Concatenate the outputs, then mix them
+    # We define a custom layer or closure for this logic
+    embed_time = Chain(
+        Parallel(vcat, rff_low, rff_high),
+        Dense(4*half_dim => embeddim, swish) # 2 * (2*half) = 4*half = 2*embeddim input? No, check dims carefully.
+        # RFF(1=>M) outputs M features. 
+        # Here: low outputs 2*half, high outputs 2*half. Total = 2*embeddim.
+        # Dense should map 2*embeddim => embeddim.
+    )
+
+    embed_state = Chain(RandomFourierFeatures(1 => 4*embeddim, 0.5f0), Dense(4*embeddim => embeddim, swish))
     ffs = [Dense(embeddim => embeddim, swish) for _ in 1:layers]
     decode = Dense(embeddim => spacedim)
     layers = (; embed_time, embed_state, ffs, decode)
@@ -34,15 +52,15 @@ function (f::FModel)(t, Xt)
 end
 
 model = FModel(embeddim = 1024, layers = 4, spacedim = 1)
-
+# NOTE TO SELF MAYBE ADD SKIP CONNECTIONS
 T = Float32
 X0_continuous_distribution = Uniform(0,4)
-X1_continuous_distribution = MixtureModel([Normal(1,1), Normal(5,0.5),Normal(-2,0.2)], [0.5,0.4,0.1])
+X1_continuous_distribution =MixtureModel([Normal(-1,0.5), Normal(5,0.5), Normal(10,0.5)], [0.2, 0.6, 0.2])
 
 sampleX0(n_samples) = SwitchingState(ContinuousState(T.(rand(X0_continuous_distribution, 1, n_samples))), DiscreteState(2, rand(1:2, 1, n_samples))) # In the beginning, we randomly either bridge to the endpoint (1) or to its negation (2)
 sampleX1(n_samples) = SwitchingState(ContinuousState(T.(rand(X1_continuous_distribution, 1, n_samples))), DiscreteState(2, ones(Int, 1, n_samples))) # Always end bridging towards the endpoint (1)
 
-n_samples = 1600 # Who knows what will be computationally tractable? 
+n_samples = 400 # Who knows what will be computationally tractable? 
 
 # Rate function for bridging
 # Returns (rate_to_x1, rate_to_neg_x1) - the rates for bridging to each endpoint
@@ -54,7 +72,7 @@ function rate_func(t, state::ForwardBackward.SwitchingState)
     x = state.continuous_state.state[1]  
     base_rate =2* μ
     rate_multiplier = x < 0 ? 1.0f0 : 5.0f0
-    
+    #rate_multiplier = 1.0f0
     r_to_x1 = base_rate * rate_multiplier * (t < 0.8 ? 1/(0.8-t) : Inf)
     r_to_neg_x1 = base_rate * rate_multiplier * max(0,0.8-t)
     
@@ -63,12 +81,24 @@ end
 
 P = SwitchingProcess(Deterministic(), rate_func)
 
-# Optimiser 
-eta = 1e-3
-opt_state = Flux.setup(AdamW(eta = eta), model)
+# Optimiser with gradient clipping
 
-iters = 6000
+eta_max = 5e-4
+eta_min = 5e-6
+opt_state = Flux.setup(AdamW(eta = eta_max), model)
+
+iters = 2000
+warmup_iters = 10
 for i in 1:iters
+    # Warmup + Cosine Annealing Schedule
+    if i <= warmup_iters
+        lr = eta_max * (i / warmup_iters)
+    else
+        progress = (i - warmup_iters - 1) / (iters - warmup_iters - 1)
+        lr = eta_min + 0.5 * (eta_max - eta_min) * (1 + cos(pi * progress))
+    end
+    Optimisers.adjust!(opt_state, lr)
+
     # Sample a batch of data
     X0 = sampleX0(n_samples)
     X1 = sampleX1(n_samples)
@@ -82,16 +112,16 @@ for i in 1:iters
         # +1 if latent==1 (bridge to X1), -1 otherwise (bridge to -X1)
         sgn = ifelse.(Xt.discrete_state.state .== 1, one(eltype(x1)), -one(eltype(x1)))
         X1_signed = ContinuousState(expand(x1, ndims(ŷ)) .* expand(sgn, ndims(ŷ)))
-        floss(P.continuous_process, ŷ, X1_signed, scalefloss(P.continuous_process, t))
+        floss(P.continuous_process, ŷ, X1_signed, scalefloss(P.continuous_process, t)) # trying a loss that is like a Beta(1/2,1/2)
+        #floss(P.continuous_process, ŷ, X1_signed, 1.0f0)
     end
     Flux.update!(opt_state, model, ∇model)
-    i > 2000 && Optimisers.adjust!(opt_state, eta - (2.5e-4/(iters-2000)))
    
-    if i % 100 == 0
-        @info "iter=$i loss=$(l)"
+    if i < 10 || i % 100 == 0
+        @info "iter=$i loss=$(l) lr=$(lr)"
     end
 end
-
+println("Training complete")
 # ---------------------------------------------------------------------
 # Marginal generation plot (100 samples) - run after training
 # ---------------------------------------------------------------------
@@ -159,7 +189,7 @@ begin
     display(plt)
     push!(all_plots, plt)
 end
-
+println("Conditional generation plot complete")
 # ---------------------------------------------------------------------
 # Conditional generation plot (endpoint-conditioned samples)
 # ---------------------------------------------------------------------
@@ -265,12 +295,12 @@ begin
     display(plt)
     push!(all_plots, plt)
 end
-
+println("Final-time density check complete")
 # ---------------------------------------------------------------------
 # Final-time density check: model vs target X1 (using model-generated samples)
 # ---------------------------------------------------------------------
 begin
-    local n_hist_samples = 10_000
+    local n_hist_samples = 5000
     local X0_hist = ContinuousState(T.(rand(X0_continuous_distribution, 1, n_hist_samples)))
     local samples_hist = gen(Deterministic(), X0_hist, model, 0f0:0.005f0:1f0)
     local final_hist = vec(Float64.(tensor(samples_hist)))
@@ -289,7 +319,7 @@ begin
     display(plt)
     push!(all_plots, plt)
 end
-
+println("Aggregate plots complete")
 # ---------------------------------------------------------------------
 # Aggregate plots into a single PDF
 # ---------------------------------------------------------------------
@@ -299,3 +329,4 @@ begin
         savefig(combined, "all_plots.pdf")
     end
 end
+println("All plots complete")
