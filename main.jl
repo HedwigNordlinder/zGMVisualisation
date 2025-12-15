@@ -3,6 +3,7 @@ Pkg.activate("/Users/hedwignordlinder/Documents/Code/Julia/Karolinska/zGMVisuali
 using Revise
 using ForwardBackward, Flowfusion, Flux, RandomFeatureMaps, Optimisers, Plots, Distributions, Statistics
 include("sexyanimation.jl")
+all_plots = []
 
 # Provide copy for SwitchingState so gen can broadcast copy.(X0_plot) when tracking
 Base.copy(s::SwitchingState) = SwitchingState(copy(s.continuous_state), copy(s.discrete_state))
@@ -32,7 +33,7 @@ function (f::FModel)(t, Xt)
     tXt .+ l.decode(x) .* (1.05f0 .- expand(t, ndims(tXt))) 
 end
 
-model = FModel(embeddim = 256, layers = 4, spacedim = 1)
+model = FModel(embeddim = 1024, layers = 4, spacedim = 1)
 
 T = Float32
 X0_continuous_distribution = Uniform(0,4)
@@ -66,7 +67,7 @@ P = SwitchingProcess(Deterministic(), rate_func)
 eta = 1e-3
 opt_state = Flux.setup(AdamW(eta = eta), model)
 
-iters = 4000
+iters = 6000
 for i in 1:iters
     # Sample a batch of data
     X0 = sampleX0(n_samples)
@@ -84,8 +85,8 @@ for i in 1:iters
         floss(P.continuous_process, ŷ, X1_signed, scalefloss(P.continuous_process, t))
     end
     Flux.update!(opt_state, model, ∇model)
-    
-    Optimisers.adjust!(opt_state, eta - 1e-3/iters)
+    i > 2000 && Optimisers.adjust!(opt_state, eta - (2.5e-4/(iters-2000)))
+   
     if i % 100 == 0
         @info "iter=$i loss=$(l)"
     end
@@ -156,6 +157,7 @@ begin
     title!(plt, "Marginal trajectories")
     savefig(plt, "marginal_generation.png")
     display(plt)
+    push!(all_plots, plt)
 end
 
 # ---------------------------------------------------------------------
@@ -261,4 +263,39 @@ begin
     title!(plt, "Conditional trajectories (endpoint-conditioned)")
     savefig(plt, "conditional_generation.png")
     display(plt)
+    push!(all_plots, plt)
+end
+
+# ---------------------------------------------------------------------
+# Final-time density check: model vs target X1 (using model-generated samples)
+# ---------------------------------------------------------------------
+begin
+    local n_hist_samples = 10_000
+    local X0_hist = ContinuousState(T.(rand(X0_continuous_distribution, 1, n_hist_samples)))
+    local samples_hist = gen(Deterministic(), X0_hist, model, 0f0:0.005f0:1f0)
+    local final_hist = vec(Float64.(tensor(samples_hist)))
+
+    local x_min = minimum(final_hist)
+    local x_max = maximum(final_hist)
+    local xgrid = collect(range(x_min, x_max; length = 400))
+    local pdf_vals = pdf.(Ref(X1_continuous_distribution), xgrid)
+
+    local plt = plot(xgrid, pdf_vals; color = :black, linewidth = 2, label = "target pdf", background_color = :white)
+    histogram!(plt, final_hist; normalize = :pdf, nbins = 60, color = :seagreen, alpha = 0.35, label = "model samples")
+    xlabel!(plt, "x")
+    ylabel!(plt, "density")
+    title!(plt, "Model final-time density vs target")
+    savefig(plt, "conditional_density_compare.png")
+    display(plt)
+    push!(all_plots, plt)
+end
+
+# ---------------------------------------------------------------------
+# Aggregate plots into a single PDF
+# ---------------------------------------------------------------------
+begin
+    if !isempty(all_plots)
+        combined = plot(all_plots...; layout = (length(all_plots), 1), size = (900, 600 * length(all_plots)), background_color = :white)
+        savefig(combined, "all_plots.pdf")
+    end
 end
