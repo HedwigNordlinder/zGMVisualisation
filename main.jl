@@ -51,30 +51,30 @@ function (f::FModel)(t, Xt)
     tXt .+ l.decode(x) .* (1.05f0 .- expand(t, ndims(tXt))) 
 end
 
-model = FModel(embeddim = 1024, layers = 4, spacedim = 1)
+model = FModel(embeddim = 1024, layers = 6, spacedim = 1)
 # NOTE TO SELF MAYBE ADD SKIP CONNECTIONS
 T = Float32
-X0_continuous_distribution = Uniform(0,4)
+X0_continuous_distribution = Normal(0,1)
 X1_continuous_distribution =MixtureModel([Normal(-1,0.5), Normal(5,0.5), Normal(10,0.5)], [0.2, 0.6, 0.2])
 
 sampleX0(n_samples) = SwitchingState(ContinuousState(T.(rand(X0_continuous_distribution, 1, n_samples))), DiscreteState(2, rand(1:2, 1, n_samples))) # In the beginning, we randomly either bridge to the endpoint (1) or to its negation (2)
 sampleX1(n_samples) = SwitchingState(ContinuousState(T.(rand(X1_continuous_distribution, 1, n_samples))), DiscreteState(2, ones(Int, 1, n_samples))) # Always end bridging towards the endpoint (1)
 
-n_samples = 400 # Who knows what will be computationally tractable? 
+n_samples = 2048 # Who knows what will be computationally tractable? 
 
 # Rate function for bridging
 # Returns (rate_to_x1, rate_to_neg_x1) - the rates for bridging to each endpoint
 # Base rate μ = 0.5, higher when continuous state is above 0
 μ = 10f0
-
+rate_divergence_time = 0.7
 # Rate function takes (t, state) and returns (rate_to_x1, rate_to_neg_x1)
 function rate_func(t, state::ForwardBackward.SwitchingState)
     x = state.continuous_state.state[1]  
     base_rate =2* μ
-    rate_multiplier = x < 0 ? 1.0f0 : 5.0f0
+    rate_multiplier = x < 0 ? 1.0f0 : 3.0f0
     #rate_multiplier = 1.0f0
-    r_to_x1 = base_rate * rate_multiplier * (t < 0.8 ? 1/(0.8-t) : Inf)
-    r_to_neg_x1 = base_rate * rate_multiplier * max(0,0.8-t)
+    r_to_x1 = base_rate * rate_multiplier * (t < rate_divergence_time ? 1/(rate_divergence_time-t) : Inf)
+    r_to_neg_x1 = base_rate * rate_multiplier * max(0,rate_divergence_time-t)
     
     return (r_to_x1, r_to_neg_x1)
 end
@@ -83,19 +83,23 @@ P = SwitchingProcess(Deterministic(), rate_func)
 
 # Optimiser with gradient clipping
 
-eta_max = 5e-4
-eta_min = 5e-6
+eta_max = 5e-5
+eta_min = 5e-7
 opt_state = Flux.setup(AdamW(eta = eta_max), model)
 
-iters = 2000
-warmup_iters = 10
+iters = 200
+warmup_iters = 20
+rampup_iters = 10
+losses = Float32[]
 for i in 1:iters
-    # Warmup + Cosine Annealing Schedule
-    if i <= warmup_iters
-        lr = eta_max * (i / warmup_iters)
+    # Rampup -> Constant High -> Linear Decay
+    if i <= rampup_iters
+         lr = eta_max * (i / rampup_iters)
+    elseif i <= warmup_iters
+        lr = eta_max
     else
-        progress = (i - warmup_iters - 1) / (iters - warmup_iters - 1)
-        lr = eta_min + 0.5 * (eta_max - eta_min) * (1 + cos(pi * progress))
+        progress = (i - warmup_iters) / (iters - warmup_iters)
+        lr = eta_max - progress * (eta_max - eta_min)
     end
     Optimisers.adjust!(opt_state, lr)
 
@@ -112,21 +116,38 @@ for i in 1:iters
         # +1 if latent==1 (bridge to X1), -1 otherwise (bridge to -X1)
         sgn = ifelse.(Xt.discrete_state.state .== 1, one(eltype(x1)), -one(eltype(x1)))
         X1_signed = ContinuousState(expand(x1, ndims(ŷ)) .* expand(sgn, ndims(ŷ)))
-        floss(P.continuous_process, ŷ, X1_signed, scalefloss(P.continuous_process, t)) # trying a loss that is like a Beta(1/2,1/2)
+        # Upweight by 2x when prediction < 0
+        #c = scalefloss(P.continuous_process, t) .* ifelse.(ŷ .< 0, 1.5f0, 1f0)
+        floss(P.continuous_process, ŷ, X1_signed, scalefloss(P.continuous_process, t))
         #floss(P.continuous_process, ŷ, X1_signed, 1.0f0)
     end
     Flux.update!(opt_state, model, ∇model)
+    push!(losses, l)
    
-    if i < 10 || i % 100 == 0
+    if i < 100 || i % 100 == 0
         @info "iter=$i loss=$(l) lr=$(lr)"
     end
 end
 println("Training complete")
 # ---------------------------------------------------------------------
+# Loss plot
+# ---------------------------------------------------------------------
+begin
+    plt_loss = plot(1:length(losses), losses; 
+        xlabel = "Iteration", ylabel = "Loss", 
+        title = "Training Loss", legend = :none,
+        linewidth = 1.5, color = :royalblue, background_color = :white,
+        size = (900, 400))
+    savefig(plt_loss, "loss.png")
+    display(plt_loss)
+    push!(all_plots, plt_loss)
+end
+println("Loss plot complete")
+# ---------------------------------------------------------------------
 # Marginal generation plot (100 samples) - run after training
 # ---------------------------------------------------------------------
 begin
-    n_plot_samples = 100
+    n_plot_samples = 1000
     quantiles = collect(range(0.01, 0.99; length = n_plot_samples))
     x0_vals = quantile.(Ref(X0_continuous_distribution), quantiles)
     X0_plot = ContinuousState(T.(reshape(x0_vals, 1, :)))  # deterministic process: only continuous part matters
@@ -177,7 +198,7 @@ begin
     for i in 1:nbins
         xcoords = [1, 1 + α * densities[i], 1 + α * densities[i], 1]
         ycoords = [edges[i], edges[i], edges[i + 1], edges[i + 1]]
-        plot!(plt, xcoords, ycoords; seriestype = :shape, c = :gray, a = 0.45, lc = :gray)
+        plot!(plt, xcoords, ycoords; seriestype = :shape, c = :gray, a = 0.3, lc = :gray)
     end
 
     xlabel!(plt, "t")
@@ -311,7 +332,7 @@ begin
     local pdf_vals = pdf.(Ref(X1_continuous_distribution), xgrid)
 
     local plt = plot(xgrid, pdf_vals; color = :black, linewidth = 2, label = "target pdf", background_color = :white)
-    histogram!(plt, final_hist; normalize = :pdf, nbins = 60, color = :seagreen, alpha = 0.35, label = "model samples")
+    histogram!(plt, final_hist; normalize = :pdf, nbins = 200, color = :seagreen, alpha = 0.45, label = "model samples")
     xlabel!(plt, "x")
     ylabel!(plt, "density")
     title!(plt, "Model final-time density vs target")
