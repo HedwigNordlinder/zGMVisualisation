@@ -1,7 +1,7 @@
 using Pkg
 Pkg.activate("/Users/hedwignordlinder/Documents/Code/Julia/Karolinska/zGMVisualisation/")
 using Revise
-using ForwardBackward, Flowfusion, Flux, RandomFeatureMaps, Optimisers, Plots, Distributions, Statistics
+using ForwardBackward, Flowfusion, Flux, RandomFeatureMaps, Optimisers, Plots, Distributions, Statistics, Zygote
 include("sexyanimation.jl")
 all_plots = []
 
@@ -43,30 +43,37 @@ function (f::FModel)(t, Xt)
     # Allow Xt to be a ContinuousState or a raw array/vector. Ensure 2D (1×N).
     tXt_raw = Xt isa ForwardBackward.ContinuousState ? Xt.state : tensor(Xt)
     tXt = ndims(tXt_raw) == 1 ? reshape(tXt_raw, 1, length(tXt_raw)) : tXt_raw
-    tv = zero(tXt[1:1,:]) .+ expand(t, ndims(tXt))
+    
+    # Reshape t to (1, N) for broadcasting/embedding
+    # t can be a scalar or a vector matching batch size
+    tv = t isa AbstractArray ? reshape(t, 1, :) : fill(t, 1, size(tXt, 2))
+    # tv = Zygote.@ignore similar(tXt_raw, 1, size(tXt, 2)) .= t 
+    # Similar is a trick that puts it on le gpu
+    
+  
+    
     x = l.embed_time(tv) .+ l.embed_state(tXt)
     for ff in l.ffs
         x = x .+ ff(x)
     end
-    tXt .+ l.decode(x) .* (1.05f0 .- expand(t, ndims(tXt))) 
+    tXt .+ l.decode(x) .* (1.05f0 .- tv) 
 end
 
-model = FModel(embeddim = 1024, layers = 6, spacedim = 1)
-# NOTE TO SELF MAYBE ADD SKIP CONNECTIONS
+model = FModel(embeddim = 1024, layers = 4, spacedim = 1)
 T = Float32
 X0_continuous_distribution = Normal(0,1)
-X1_continuous_distribution =MixtureModel([Normal(-1,0.5), Normal(5,0.5), Normal(10,0.5)], [0.2, 0.6, 0.2])
+X1_continuous_distribution =MixtureModel([Normal(-0.5,0.1), Normal(0.6,0.5), Normal(0.9,0.1)], [0.2, 0.4, 0.4])
 
 sampleX0(n_samples) = SwitchingState(ContinuousState(T.(rand(X0_continuous_distribution, 1, n_samples))), DiscreteState(2, rand(1:2, 1, n_samples))) # In the beginning, we randomly either bridge to the endpoint (1) or to its negation (2)
 sampleX1(n_samples) = SwitchingState(ContinuousState(T.(rand(X1_continuous_distribution, 1, n_samples))), DiscreteState(2, ones(Int, 1, n_samples))) # Always end bridging towards the endpoint (1)
 
-n_samples = 2048 # Who knows what will be computationally tractable? 
+n_samples = 4096 # Who knows what will be computationally tractable? 
 
 # Rate function for bridging
 # Returns (rate_to_x1, rate_to_neg_x1) - the rates for bridging to each endpoint
 # Base rate μ = 0.5, higher when continuous state is above 0
-μ = 10f0
-rate_divergence_time = 0.7
+μ = 3f0
+rate_divergence_time = 0.67
 # Rate function takes (t, state) and returns (rate_to_x1, rate_to_neg_x1)
 function rate_func(t, state::ForwardBackward.SwitchingState)
     x = state.continuous_state.state[1]  
@@ -79,17 +86,18 @@ function rate_func(t, state::ForwardBackward.SwitchingState)
     return (r_to_x1, r_to_neg_x1)
 end
 
+
 P = SwitchingProcess(Deterministic(), rate_func)
 
 # Optimiser with gradient clipping
 
 eta_max = 5e-5
-eta_min = 5e-7
+eta_min = 1e-9
 opt_state = Flux.setup(AdamW(eta = eta_max), model)
 
-iters = 200
-warmup_iters = 20
-rampup_iters = 10
+iters = 1000
+warmup_iters = 200
+rampup_iters = 50
 losses = Float32[]
 for i in 1:iters
     # Rampup -> Constant High -> Linear Decay
@@ -108,7 +116,7 @@ for i in 1:iters
     X1 = sampleX1(n_samples)
     t = rand(T, n_samples)
     # Construct the bridge
-    Xt = endpoint_conditioned_sample(X1, X0, P, t)
+    Xt = endpoint_conditioned_sample(X1, X0, P, t; δt = 1e-3)
     # Gradient and update
     l, (∇model,) = Flux.withgradient(model) do m
         ŷ = m(t, Xt.continuous_state)
@@ -118,6 +126,7 @@ for i in 1:iters
         X1_signed = ContinuousState(expand(x1, ndims(ŷ)) .* expand(sgn, ndims(ŷ)))
         # Upweight by 2x when prediction < 0
         #c = scalefloss(P.continuous_process, t) .* ifelse.(ŷ .< 0, 1.5f0, 1f0)
+        
         floss(P.continuous_process, ŷ, X1_signed, scalefloss(P.continuous_process, t))
         #floss(P.continuous_process, ŷ, X1_signed, 1.0f0)
     end
@@ -272,21 +281,16 @@ begin
     end
     @assert tvec_ref[] !== nothing
 
-    nbins = 35
-    edges = collect(range(minimum(y_final), maximum(y_final); length = nbins + 1))
-    binwidth = edges[2] - edges[1]
-    densities = zeros(Float64, nbins)
-    for i in 1:nbins
-        lo = edges[i]
-        hi = edges[i + 1]
-        densities[i] = count(x -> (x >= lo) && (x < hi), y_final)
-    end
-    if !isempty(densities)
-        densities ./= (length(y_final) * binwidth)
-    end
-
+    # Use analytical PDF from X1_continuous_distribution
+    y_min_plot = minimum(y_final) - 0.2
+    y_max_plot = maximum(y_final) + 0.2
+    y_grid = collect(range(y_min_plot, y_max_plot; length = 200))
+    
+    # Evaluate the analytical density
+    density_vals = pdf.(Ref(X1_continuous_distribution), y_grid)
+    
     α = 0.25
-    x_right = 1 + α * (isempty(densities) ? 0 : maximum(densities)) * 1.25
+    x_right = 1 + α * maximum(density_vals) * 1.25
     y_min = min(minimum(Y), minimum(x1_targets))
     y_max = max(maximum(Y), maximum(x1_targets))
 
@@ -298,14 +302,10 @@ begin
             plot!(plt, tvec_ref[][j:j+1], Y[i, j:j+1]; color = seg_color, alpha = 0.25, linewidth = 1.2)
         end
     end
-    scatter!(plt, fill(1.0, length(x1_targets)), x1_targets;
-             color = :orange, markerstrokecolor = :black, markersize = 4, alpha = 0.8)
 
-    for i in 1:nbins
-        xcoords = [1, 1 + α * densities[i], 1 + α * densities[i], 1]
-        ycoords = [edges[i], edges[i], edges[i + 1], edges[i + 1]]
-        plot!(plt, xcoords, ycoords; seriestype = :shape, c = :gray, a = 0.45, lc = :gray)
-    end
+    # Plot density curve instead of histogram
+    density_x = 1 .+ α .* density_vals
+    plot!(plt, density_x, y_grid; color = :gray, alpha = 0.7, linewidth = 2, fillrange = 1, fillalpha = 0.3, fillcolor = :gray)
 
     xlabel!(plt, "t")
     ylabel!(plt, "x")
@@ -320,18 +320,18 @@ println("Final-time density check complete")
 # ---------------------------------------------------------------------
 # Final-time density check: model vs target X1 (using model-generated samples)
 # ---------------------------------------------------------------------
-begin
-    local n_hist_samples = 5000
-    local X0_hist = ContinuousState(T.(rand(X0_continuous_distribution, 1, n_hist_samples)))
-    local samples_hist = gen(Deterministic(), X0_hist, model, 0f0:0.005f0:1f0)
-    local final_hist = vec(Float64.(tensor(samples_hist)))
 
-    local x_min = minimum(final_hist)
-    local x_max = maximum(final_hist)
-    local xgrid = collect(range(x_min, x_max; length = 400))
-    local pdf_vals = pdf.(Ref(X1_continuous_distribution), xgrid)
+     n_hist_samples = 5000
+     X0_hist = ContinuousState(T.(rand(X0_continuous_distribution,1, n_hist_samples)))
+     samples_hist = gen(Deterministic(), X0_hist, model, 0f0:0.005f0:1f0)
+     final_hist = vec(Float64.(tensor(samples_hist)))
 
-    local plt = plot(xgrid, pdf_vals; color = :black, linewidth = 2, label = "target pdf", background_color = :white)
+     x_min = minimum(final_hist)
+     x_max = maximum(final_hist)
+     xgrid = collect(range(x_min, x_max; length = 400))
+     pdf_vals = pdf.(Ref(X1_continuous_distribution), xgrid)
+
+     plt = plot(xgrid, pdf_vals; color = :black, linewidth = 2, label = "target pdf", background_color = :white)
     histogram!(plt, final_hist; normalize = :pdf, nbins = 200, color = :seagreen, alpha = 0.45, label = "model samples")
     xlabel!(plt, "x")
     ylabel!(plt, "density")
@@ -339,8 +339,94 @@ begin
     savefig(plt, "conditional_density_compare.png")
     display(plt)
     push!(all_plots, plt)
-end
+
 println("Aggregate plots complete")
+# ---------------------------------------------------------------------
+# Save raw data for plotting
+# ---------------------------------------------------------------------
+begin
+    using DelimitedFiles
+    
+    # Create data directory if it doesn't exist
+    data_dir = "plot_data"
+    mkpath(data_dir)
+    
+    # 1. Save training losses
+    writedlm(joinpath(data_dir, "losses.csv"), 
+             hcat(1:length(losses), losses), 
+             ',')
+    println("Saved losses to $(data_dir)/losses.csv")
+    
+    # 2. Save marginal generation trajectories
+    # tvec is (nsteps,), xttraj is (xdim, nsamples, nsteps)
+    # Save time vector
+    writedlm(joinpath(data_dir, "marginal_tvec.csv"), tvec, ',')
+    
+    # Save trajectories (reshape to 2D: each row is a trajectory over time)
+    xttraj_2d = reshape(xttraj, size(xttraj, 1) * size(xttraj, 2), size(xttraj, 3))'  # (nsteps, nsamples)
+    writedlm(joinpath(data_dir, "marginal_trajectories.csv"), xttraj_2d, ',')
+    
+    # Save initial conditions
+    writedlm(joinpath(data_dir, "marginal_x0_vals.csv"), x0_vals, ',')
+    
+    # Save final samples
+    final_samples = vec(Float64.(tensor(samples)))
+    writedlm(joinpath(data_dir, "marginal_final_samples.csv"), final_samples, ',')
+    println("Saved marginal generation data to $(data_dir)/marginal_*.csv")
+    
+    # 3. Save conditional trajectories
+    writedlm(joinpath(data_dir, "conditional_tvec.csv"), tvec_ref[], ',')
+    writedlm(joinpath(data_dir, "conditional_trajectories_Y.csv"), Y, ',')  # (n_cond_samples, n_timesteps)
+    writedlm(joinpath(data_dir, "conditional_states_D.csv"), D, ',')  # discrete states
+    writedlm(joinpath(data_dir, "conditional_y_final.csv"), y_final, ',')
+    writedlm(joinpath(data_dir, "conditional_x1_targets.csv"), x1_targets, ',')
+    
+    # Save density curve for conditional plot
+    writedlm(joinpath(data_dir, "conditional_density_ygrid.csv"), y_grid, ',')
+    writedlm(joinpath(data_dir, "conditional_density_vals.csv"), density_vals, ',')
+    println("Saved conditional trajectories data to $(data_dir)/conditional_*.csv")
+    
+    # 4. Save final density comparison data
+    writedlm(joinpath(data_dir, "final_density_model_samples.csv"), final_hist, ',')
+    writedlm(joinpath(data_dir, "final_density_xgrid.csv"), xgrid, ',')
+    writedlm(joinpath(data_dir, "final_density_target_pdf.csv"), pdf_vals, ',')
+    println("Saved final density comparison data to $(data_dir)/final_density_*.csv")
+    
+    # 5. Save metadata/info file
+    open(joinpath(data_dir, "README.txt"), "w") do io
+        println(io, "Raw data for plotting - Generated on $(now())")
+        println(io, "="^60)
+        println(io, "\n1. Training Data:")
+        println(io, "   - losses.csv: [iteration, loss_value]")
+        println(io, "   - Shape: $(length(losses)) iterations")
+        println(io, "\n2. Marginal Generation Data:")
+        println(io, "   - marginal_tvec.csv: time points ($(length(tvec)) steps)")
+        println(io, "   - marginal_trajectories.csv: trajectories over time ($(size(xttraj_2d)))")
+        println(io, "   - marginal_x0_vals.csv: initial conditions ($(length(x0_vals)) samples)")
+        println(io, "   - marginal_final_samples.csv: final time values ($(length(final_samples)) samples)")
+        println(io, "\n3. Conditional Trajectories Data:")
+        println(io, "   - conditional_tvec.csv: time points ($(length(tvec_ref[])) steps)")
+        println(io, "   - conditional_trajectories_Y.csv: continuous states ($(size(Y)))")
+        println(io, "   - conditional_states_D.csv: discrete states ($(size(D)))")
+        println(io, "   - conditional_y_final.csv: final values ($(length(y_final)) samples)")
+        println(io, "   - conditional_x1_targets.csv: target endpoints ($(length(x1_targets)) samples)")
+        println(io, "   - conditional_density_ygrid.csv: density plot y-axis ($(length(y_grid)) points)")
+        println(io, "   - conditional_density_vals.csv: density values ($(length(density_vals)) points)")
+        println(io, "\n4. Final Density Comparison:")
+        println(io, "   - final_density_model_samples.csv: model samples ($(length(final_hist)) samples)")
+        println(io, "   - final_density_xgrid.csv: x-axis for PDF ($(length(xgrid)) points)")
+        println(io, "   - final_density_target_pdf.csv: target PDF values ($(length(pdf_vals)) points)")
+        println(io, "\n5. Model Parameters:")
+        println(io, "   - n_samples: $(n_samples)")
+        println(io, "   - iterations: $(iters)")
+        println(io, "   - embedding dimension: 1024")
+        println(io, "   - n_plot_samples: $(n_plot_samples)")
+        println(io, "   - n_cond_samples: $(n_cond_samples)")
+    end
+    println("Saved metadata to $(data_dir)/README.txt")
+    println("\nAll raw data saved to '$(data_dir)/' directory")
+end
+
 # ---------------------------------------------------------------------
 # Aggregate plots into a single PDF
 # ---------------------------------------------------------------------
