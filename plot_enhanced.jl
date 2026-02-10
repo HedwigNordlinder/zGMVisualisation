@@ -17,87 +17,7 @@ println("Loading data from CSVs...")
 all_plots = []
 
 # ---------------------------------------------------------------------
-# 1. Loss plot
-# ---------------------------------------------------------------------
-begin
-    losses_data = readdlm(joinpath(data_dir, "losses.csv"), ',')
-    iterations = losses_data[:, 1]
-    losses = losses_data[:, 2]
-    
-    plt_loss = plot(iterations, losses; 
-        xlabel = "Iteration", ylabel = "Loss", 
-        title = "Training Loss", legend = :none,
-        linewidth = 1.5, color = :royalblue, background_color = :white,
-        size = (900, 400))
-    
-    display(plt_loss)
-    push!(all_plots, plt_loss)
-    println("✓ Loss plot recreated")
-end
-
-# ---------------------------------------------------------------------
-# 2. Marginal generation plot
-# ---------------------------------------------------------------------
-begin
-    tvec = vec(readdlm(joinpath(data_dir, "marginal_tvec.csv"), ','))
-    xttraj_2d = readdlm(joinpath(data_dir, "marginal_trajectories.csv"), ',')
-    x0_vals = vec(readdlm(joinpath(data_dir, "marginal_x0_vals.csv"), ','))
-    final_samples = vec(readdlm(joinpath(data_dir, "marginal_final_samples.csv"), ','))
-    
-    # xttraj_2d is (nsteps, nsamples) - transpose to get trajectories as rows
-    nsteps, nsamples = size(xttraj_2d)
-    
-    # Append final time point
-    t_full = [tvec; 1.0]
-    Y = xttraj_2d'  # Now (nsamples, nsteps)
-    
-    # Add final samples
-    Y_full = hcat(Y, final_samples)  # (nsamples, nsteps+1)
-    
-    # Histogram of final-time values
-    final_vals = final_samples
-    nbins = 35
-    edges = collect(range(minimum(final_vals), maximum(final_vals); length = nbins + 1))
-    binwidth = edges[2] - edges[1]
-    densities = zeros(Float64, nbins)
-    for i in 1:nbins
-        lo, hi = edges[i], edges[i + 1]
-        densities[i] = count(x -> (x >= lo) && (x < hi), final_vals)
-    end
-    if !isempty(densities)
-        densities ./= (length(final_vals) * binwidth)
-    end
-    
-    α = 0.25
-    x_right = 1 + α * (isempty(densities) ? 0 : maximum(densities)) * 1.25
-    y_min = minimum(Y_full)
-    y_max = maximum(Y_full)
-    
-    plt = plot(; legend = :none, size = (900, 600), background_color = :white)
-    for i in 1:nsamples
-        plot!(plt, t_full, Y_full[i, :]; color = :royalblue, alpha = 0.2, linewidth = 1)
-    end
-    
-    # Right-anchored histogram at t = 1
-    for i in 1:nbins
-        xcoords = [1, 1 + α * densities[i], 1 + α * densities[i], 1]
-        ycoords = [edges[i], edges[i], edges[i + 1], edges[i + 1]]
-        plot!(plt, xcoords, ycoords; seriestype = :shape, c = :gray, a = 0.3, lc = :gray)
-    end
-    
-    xlabel!(plt, "t")
-    ylabel!(plt, "x")
-    xlims!(plt, 0, x_right)
-    ylims!(plt, y_min, y_max)
-    title!(plt, "Marginal trajectories")
-    
-    display(plt)
-    push!(all_plots, plt)
-    println("✓ Marginal generation plot recreated")
-end
-
-# ---------------------------------------------------------------------
-# 3. ENHANCED Conditional generation plot with highlighted top-10 switchers
+# Plot B: ENHANCED Conditional generation plot with highlighted top-10 switchers
 # ---------------------------------------------------------------------
 begin
     if REGENERATE_CONDITIONAL_SAMPLES
@@ -189,13 +109,36 @@ begin
         end
     end
     
-    # Find the 10 tracks with the most switches
-    top_switchers_indices = partialsort(1:n_cond_samples, 1:min(10, n_cond_samples), 
-                                        by=i -> switch_counts[i], rev=true)
+    # Split tracks by starting position (below zero vs above zero)
+    below_zero_indices = Int[]
+    above_zero_indices = Int[]
+    for i in 1:n_cond_samples
+        if Y[i, 1] < 0
+            push!(below_zero_indices, i)
+        elseif Y[i, 1] > 0
+            push!(above_zero_indices, i)
+        end
+    end
     
-    println("\n🎯 Top 10 switchers:")
-    for (rank, idx) in enumerate(top_switchers_indices)
-        println("   Rank $rank: Track $idx with $(switch_counts[idx]) switches")
+    # Get top 5 switchers from each group
+    n_below = min(5, length(below_zero_indices))
+    n_above = min(5, length(above_zero_indices))
+    
+    top_below = partialsort(below_zero_indices, 1:n_below, 
+                           by=i -> switch_counts[i], rev=true)
+    top_above = partialsort(above_zero_indices, 1:n_above, 
+                           by=i -> switch_counts[i], rev=true)
+    
+    top_switchers_indices = vcat(top_below, top_above)
+    
+    println("\n🎯 Top 10 switchers (5 starting below zero, 5 starting above zero):")
+    println("   Starting BELOW zero:")
+    for (rank, idx) in enumerate(top_below)
+        println("      Track $idx: $(switch_counts[idx]) switches, x0=$(round(Y[idx, 1], digits=3))")
+    end
+    println("   Starting ABOVE zero:")
+    for (rank, idx) in enumerate(top_above)
+        println("      Track $idx: $(switch_counts[idx]) switches, x0=$(round(Y[idx, 1], digits=3))")
     end
     println()
     
@@ -240,44 +183,106 @@ begin
     ylabel!(plt, "x")
     xlims!(plt, 0, x_right)
     ylims!(plt, y_min, y_max)
-    title!(plt, "Conditional trajectories (top 10 switchers highlighted)")
+    title!(plt, "A")
     
     savefig(plt, joinpath(dirname(script_dir), "conditional_generation_enhanced.png"))
     display(plt)
     push!(all_plots, plt)
-    println("✓ Enhanced conditional generation plot created")
+    println("✓ Plot A: Enhanced conditional generation plot created")
 end
 
 # ---------------------------------------------------------------------
-# 4. Final-time density check
+# Plot A: Marginal generation plot
+# ---------------------------------------------------------------------
+begin
+    tvec = vec(readdlm(joinpath(data_dir, "marginal_tvec.csv"), ','))
+    xttraj_2d = readdlm(joinpath(data_dir, "marginal_trajectories.csv"), ',')
+    x0_vals = vec(readdlm(joinpath(data_dir, "marginal_x0_vals.csv"), ','))
+    final_samples = vec(readdlm(joinpath(data_dir, "marginal_final_samples.csv"), ','))
+    
+    # xttraj_2d is (nsteps, nsamples) - transpose to get trajectories as rows
+    nsteps, nsamples = size(xttraj_2d)
+    
+    # Append final time point
+    t_full = [tvec; 1.0]
+    Y = xttraj_2d'  # Now (nsamples, nsteps)
+    
+    # Add final samples
+    Y_full = hcat(Y, final_samples)  # (nsamples, nsteps+1)
+    
+    # Histogram of final-time values
+    final_vals = final_samples
+    nbins = 35
+    edges = collect(range(minimum(final_vals), maximum(final_vals); length = nbins + 1))
+    binwidth = edges[2] - edges[1]
+    densities = zeros(Float64, nbins)
+    for i in 1:nbins
+        lo, hi = edges[i], edges[i + 1]
+        densities[i] = count(x -> (x >= lo) && (x < hi), final_vals)
+    end
+    if !isempty(densities)
+        densities ./= (length(final_vals) * binwidth)
+    end
+    
+    α = 0.25
+    x_right = 1 + α * (isempty(densities) ? 0 : maximum(densities)) * 1.25
+    y_min = minimum(Y_full)
+    y_max = maximum(Y_full)
+    
+    plt = plot(; legend = :none, size = (900, 600), background_color = :white)
+    for i in 1:nsamples
+        plot!(plt, t_full, Y_full[i, :]; color = :royalblue, alpha = 0.2, linewidth = 1)
+    end
+    
+    # Right-anchored histogram at t = 1
+    for i in 1:nbins
+        xcoords = [1, 1 + α * densities[i], 1 + α * densities[i], 1]
+        ycoords = [edges[i], edges[i], edges[i + 1], edges[i + 1]]
+        plot!(plt, xcoords, ycoords; seriestype = :shape, c = :gray, a = 0.3, lc = :gray)
+    end
+    
+    xlabel!(plt, "t")
+    ylabel!(plt, "x")
+    xlims!(plt, 0, x_right)
+    ylims!(plt, y_min, y_max)
+    title!(plt, "B")
+    
+    display(plt)
+    push!(all_plots, plt)
+    println("✓ Plot B: Marginal generation plot recreated")
+end
+
+# ---------------------------------------------------------------------
+# Plot C: Final-time density check
 # ---------------------------------------------------------------------
 begin
     final_hist = vec(readdlm(joinpath(data_dir, "final_density_model_samples.csv"), ','))
     xgrid = vec(readdlm(joinpath(data_dir, "final_density_xgrid.csv"), ','))
     pdf_vals = vec(readdlm(joinpath(data_dir, "final_density_target_pdf.csv"), ','))
     
-    plt = plot(xgrid, pdf_vals; color = :black, linewidth = 2, label = "target pdf", 
-               background_color = :white)
+    plt = plot(xgrid, pdf_vals; color = :black, linewidth = 2, label = false, 
+               background_color = :white, legend = false)
     histogram!(plt, final_hist; normalize = :pdf, nbins = 200, color = :seagreen, 
-               alpha = 0.45, label = "model samples")
+               alpha = 0.45, label = false)
     xlabel!(plt, "x")
     ylabel!(plt, "density")
-    title!(plt, "Model final-time density vs target")
+    title!(plt, "C")
     
     display(plt)
     push!(all_plots, plt)
-    println("✓ Final density comparison plot recreated")
+    println("✓ Plot C: Final density comparison plot recreated")
 end
 
 # ---------------------------------------------------------------------
-# 5. Aggregate plots into a single PDF
+# Aggregate plots into a single high-resolution PDF (2x2 layout: A, B on top; C centered below)
 # ---------------------------------------------------------------------
 begin
     if !isempty(all_plots)
-        combined = plot(all_plots...; layout = (length(all_plots), 1), 
-                       size = (900, 600 * length(all_plots)), background_color = :white)
+        l = @layout [a b; c]
+        combined = plot(all_plots...; layout = l, 
+                       size = (1800, 1200), background_color = :white, dpi = 300)
         savefig(combined, joinpath(dirname(script_dir), "all_plots_enhanced.pdf"))
-        println("\n✨ All plots saved to all_plots_enhanced.pdf")
+        println("\n✨ All plots saved to all_plots_enhanced.pdf (300 DPI)")
     end
 end
 
